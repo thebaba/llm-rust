@@ -162,16 +162,6 @@ struct OllamaChatResponseMessage {
     tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
-#[derive(Deserialize, Debug)]
-struct OllamaChatStreamResponse {
-    message: OllamaChatStreamMessage,
-}
-
-#[derive(Deserialize, Debug)]
-struct OllamaChatStreamMessage {
-    content: String,
-}
-
 /// Request payload for Ollama's generate API endpoint.
 #[derive(Serialize)]
 struct OllamaGenerateRequest<'a> {
@@ -610,15 +600,18 @@ impl crate::LLMProvider for Ollama {
 impl TextToSpeechProvider for Ollama {}
 
 /// Parses a Server-Sent Events (SSE) chunk from Ollama's streaming API.
-/// Ollama events differ from other providers because it uses json lines instead of the expected SSE format.
+///
+/// Ollama's streaming format sends JSON objects separated by newlines, where each
+/// object contains a "message" field with the content delta.
+///
 /// # Arguments
 ///
-/// * `chunk` - The raw SSE chunk text
+/// * `chunk` - Raw SSE chunk data as a string
 ///
 /// # Returns
 ///
-/// * `Ok(Some(String))` - Content token if found
-/// * `Ok(None)` - If chunk should be skipped (e.g., ping, done signal)
+/// * `Ok(Some(String))` - If content was extracted from the chunk
+/// * `Ok(None)` - If the chunk contained no content or was a control message
 /// * `Err(LLMError)` - If parsing fails
 fn parse_ollama_sse(chunk: &str) -> Result<Option<String>, LLMError> {
     let mut collected_content = String::new();
@@ -626,11 +619,33 @@ fn parse_ollama_sse(chunk: &str) -> Result<Option<String>, LLMError> {
     for line in chunk.lines() {
         let line = line.trim();
 
-        match serde_json::from_str::<OllamaChatStreamResponse>(line) {
-            Ok(data) => {
-                collected_content.push_str(&data.message.content);
+        // Skip empty lines
+        if line.is_empty() {
+            continue;
+        }
+
+        // Parse as generic JSON first to check for completion and extract data efficiently
+        let json_value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => continue, // Skip unparseable lines
+        };
+
+        // Check if this is the final message (done: true)
+        if let Some(true) = json_value.get("done").and_then(|v| v.as_bool()) {
+            return if collected_content.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(collected_content))
+            };
+        }
+
+        // Extract content from the message field
+        if let Some(message) = json_value.get("message") {
+            if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
+                if !content.is_empty() {
+                    collected_content.push_str(content);
+                }
             }
-            Err(e) => return Err(LLMError::JsonError(e.to_string())),
         }
     }
 
