@@ -277,6 +277,220 @@ struct OllamaFunctionCall {
     arguments: Value,
 }
 
+/// Ollama streaming response structure for NDJSON parsing
+#[derive(Deserialize, Debug)]
+struct OllamaStreamResponse {
+    /// Message content and tool calls
+    message: Option<OllamaStreamMessage>,
+    /// Whether this is the final chunk
+    done: bool,
+    /// Prompt tokens used (present in final chunk)
+    #[serde(default)]
+    prompt_eval_count: Option<u32>,
+    /// Completion tokens used (present in final chunk)
+    #[serde(default)]
+    eval_count: Option<u32>,
+}
+
+/// Ollama streaming message structure
+#[derive(Deserialize, Debug)]
+struct OllamaStreamMessage {
+    /// Text content
+    #[serde(default)]
+    content: String,
+    /// Tool calls (may be present in streaming responses)
+    tool_calls: Option<Vec<OllamaToolCall>>,
+}
+
+use crate::chat::{StreamChoice, StreamDelta, StreamResponse, Usage};
+
+/// Stateful parser for Ollama's NDJSON streaming with tool call accumulation
+struct OllamaNDJSONStreamParser {
+    /// Buffer for incomplete JSON lines split across chunks
+    line_buffer: String,
+    /// Buffer for incomplete UTF-8 sequences
+    utf8_buffer: Vec<u8>,
+    /// Accumulated tool call being built
+    tool_buffer: ToolCall,
+    /// Accumulated usage metadata (if any)
+    usage: Option<Usage>,
+    /// Results ready to be emitted
+    results: Vec<Result<StreamResponse, LLMError>>,
+}
+
+impl OllamaNDJSONStreamParser {
+    fn new() -> Self {
+        Self {
+            line_buffer: String::new(),
+            utf8_buffer: Vec::new(),
+            tool_buffer: ToolCall {
+                id: String::new(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: String::new(),
+                    arguments: String::new(),
+                },
+            },
+            usage: None,
+            results: Vec::new(),
+        }
+    }
+
+    /// Push the current tool_buffer as a StreamResponse and reset it
+    fn push_tool_call(&mut self) {
+        if !self.tool_buffer.function.name.is_empty() {
+            self.results.push(Ok(StreamResponse {
+                choices: vec![StreamChoice {
+                    delta: StreamDelta {
+                        content: None,
+                        tool_calls: Some(vec![self.tool_buffer.clone()]),
+                    },
+                }],
+                usage: None,
+            }));
+        }
+        self.tool_buffer = ToolCall {
+            id: String::new(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: String::new(),
+                arguments: String::new(),
+            },
+        };
+    }
+
+    /// Process raw bytes, handling UTF-8 boundaries and line splitting
+    fn process_bytes(&mut self, bytes: &[u8]) {
+        // Append to UTF-8 buffer and try to decode
+        self.utf8_buffer.extend_from_slice(bytes);
+
+        match String::from_utf8(std::mem::take(&mut self.utf8_buffer)) {
+            Ok(text) => {
+                self.line_buffer.push_str(&text);
+            }
+            Err(e) => {
+                let valid_up_to = e.utf8_error().valid_up_to();
+                let bytes = e.into_bytes();
+                if valid_up_to > 0 {
+                    // Safe because we know this portion is valid UTF-8
+                    let valid = unsafe { std::str::from_utf8_unchecked(&bytes[..valid_up_to]) };
+                    self.line_buffer.push_str(valid);
+                }
+                // Keep the incomplete bytes for next chunk
+                self.utf8_buffer = bytes[valid_up_to..].to_vec();
+            }
+        }
+
+        // Process complete lines (NDJSON uses single newlines)
+        while let Some(pos) = self.line_buffer.find('\n') {
+            let line = self.line_buffer[..pos].to_string();
+            self.line_buffer.drain(..pos + 1);
+
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                self.parse_line(trimmed);
+            }
+        }
+    }
+
+    /// Parse a single NDJSON line
+    fn parse_line(&mut self, line: &str) {
+        let response: OllamaStreamResponse = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(e) => {
+                log::debug!("Failed to parse Ollama stream line: {}", e);
+                return;
+            }
+        };
+
+        // Handle final chunk
+        if response.done {
+            // Flush any accumulated tool call
+            self.push_tool_call();
+
+            // Extract usage from final chunk if available
+            if let (Some(prompt_tokens), Some(completion_tokens)) =
+                (response.prompt_eval_count, response.eval_count)
+            {
+                self.usage = Some(Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
+                    completion_tokens_details: None,
+                    prompt_tokens_details: None,
+                });
+            }
+
+            // Emit usage if present
+            if let Some(usage) = self.usage.take() {
+                self.results.push(Ok(StreamResponse {
+                    choices: vec![StreamChoice {
+                        delta: StreamDelta {
+                            content: None,
+                            tool_calls: None,
+                        },
+                    }],
+                    usage: Some(usage),
+                }));
+            }
+            return;
+        }
+
+        // Process message content
+        if let Some(message) = response.message {
+            let content = if message.content.is_empty() {
+                None
+            } else {
+                Some(message.content)
+            };
+
+            // Handle tool calls with accumulation
+            if let Some(tool_calls) = message.tool_calls {
+                for tc in tool_calls {
+                    // If we see a new function name, flush the previous tool call
+                    if !tc.function.name.is_empty() {
+                        self.push_tool_call();
+                        self.tool_buffer.function.name = tc.function.name.clone();
+                        self.tool_buffer.id = generate_tool_call_id();
+                    }
+                    // Accumulate arguments (may span multiple chunks)
+                    let args_str = serde_json::to_string(&tc.function.arguments).unwrap_or_default();
+                    // Remove the outer quotes if it's a string, or keep as-is for objects
+                    let args_clean = if args_str.starts_with('"') && args_str.ends_with('"') {
+                        // It's a JSON string, unescape it
+                        tc.function.arguments.as_str().unwrap_or(&args_str).to_string()
+                    } else {
+                        args_str
+                    };
+                    self.tool_buffer.function.arguments.push_str(&args_clean);
+                }
+            }
+
+            // Emit content if present
+            if content.is_some() {
+                self.results.push(Ok(StreamResponse {
+                    choices: vec![StreamChoice {
+                        delta: StreamDelta {
+                            content,
+                            tool_calls: None,
+                        },
+                    }],
+                    usage: None,
+                }));
+            }
+        }
+    }
+}
+
+/// Generate a simple unique ID for tool calls
+fn generate_tool_call_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("call_{:x}{:x}", d.as_secs(), d.subsec_nanos())
+}
+
 impl Ollama {
     /// Creates a new Ollama client with the specified configuration.
     ///
@@ -414,7 +628,40 @@ impl ChatProvider for Ollama {
         &self,
         messages: &[ChatMessage],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>>, LLMError> {
-        let req_body = self.make_chat_request(messages, None, true);
+        use futures::StreamExt;
+
+        let struct_stream = self.chat_stream_struct(messages).await?;
+        let content_stream = struct_stream.filter_map(|result| async move {
+            match result {
+                Ok(resp) => resp
+                    .choices
+                    .first()
+                    .and_then(|c| c.delta.content.clone())
+                    .filter(|s| !s.is_empty())
+                    .map(Ok),
+                Err(e) => Some(Err(e)),
+            }
+        });
+        Ok(Box::pin(content_stream))
+    }
+
+    async fn chat_stream_struct(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamResponse, LLMError>> + Send>>, LLMError>
+    {
+        if self.base_url.is_empty() {
+            return Err(LLMError::InvalidRequest("Missing base_url".to_string()));
+        }
+
+        // Pass tools to the request with stream=true
+        let req_body = self.make_chat_request(messages, self.tools.as_deref(), true);
+
+        if log::log_enabled!(log::Level::Trace) {
+            if let Ok(json) = serde_json::to_string(&req_body) {
+                log::trace!("Ollama request payload (stream_struct): {}", json);
+            }
+        }
 
         let url = format!("{}/api/chat", self.base_url);
         let mut request = self.client.post(&url).json(&req_body);
@@ -424,11 +671,18 @@ impl ChatProvider for Ollama {
         }
 
         let resp = request.send().await?;
-        log::debug!("Ollama HTTP status: {}", resp.status());
+        log::debug!("Ollama HTTP status (stream_struct): {}", resp.status());
 
-        let resp = resp.error_for_status()?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_text = resp.text().await?;
+            return Err(LLMError::ResponseFormatError {
+                message: format!("Ollama API returned error status: {status}"),
+                raw_response: error_text,
+            });
+        }
 
-        Ok(crate::chat::create_ndjson_stream(resp, parse_ollama_sse))
+        Ok(create_ollama_ndjson_struct_stream(resp))
     }
 }
 
@@ -599,59 +853,27 @@ impl crate::LLMProvider for Ollama {
 #[async_trait]
 impl TextToSpeechProvider for Ollama {}
 
-/// Parses a Server-Sent Events (SSE) chunk from Ollama's streaming API.
-///
-/// Ollama's streaming format sends JSON objects separated by newlines, where each
-/// object contains a "message" field with the content delta.
-///
-/// # Arguments
-///
-/// * `chunk` - Raw SSE chunk data as a string
-///
-/// # Returns
-///
-/// * `Ok(Some(String))` - If content was extracted from the chunk
-/// * `Ok(None)` - If the chunk contained no content or was a control message
-/// * `Err(LLMError)` - If parsing fails
-fn parse_ollama_sse(chunk: &str) -> Result<Option<String>, LLMError> {
-    let mut collected_content = String::new();
+/// Creates a structured NDJSON stream that returns `StreamResponse` objects
+/// with tool call accumulation support for Ollama's streaming API
+fn create_ollama_ndjson_struct_stream(
+    response: reqwest::Response,
+) -> Pin<Box<dyn Stream<Item = Result<StreamResponse, LLMError>> + Send>> {
+    use futures::StreamExt;
 
-    for line in chunk.lines() {
-        let line = line.trim();
+    let bytes_stream = response.bytes_stream();
 
-        // Skip empty lines
-        if line.is_empty() {
-            continue;
-        }
-
-        // Parse as generic JSON first to check for completion and extract data efficiently
-        let json_value: serde_json::Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(_) => continue, // Skip unparseable lines
-        };
-
-        // Check if this is the final message (done: true)
-        if let Some(true) = json_value.get("done").and_then(|v| v.as_bool()) {
-            return if collected_content.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(collected_content))
-            };
-        }
-
-        // Extract content from the message field
-        if let Some(message) = json_value.get("message") {
-            if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
-                if !content.is_empty() {
-                    collected_content.push_str(content);
+    let stream = bytes_stream
+        .scan(OllamaNDJSONStreamParser::new(), |parser, chunk| {
+            let results = match chunk {
+                Ok(bytes) => {
+                    parser.process_bytes(&bytes);
+                    parser.results.drain(..).collect::<Vec<_>>()
                 }
-            }
-        }
-    }
+                Err(e) => vec![Err(LLMError::HttpError(e.to_string()))],
+            };
+            futures::future::ready(Some(results))
+        })
+        .flat_map(futures::stream::iter);
 
-    if collected_content.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(collected_content))
-    }
+    Box::pin(stream)
 }
