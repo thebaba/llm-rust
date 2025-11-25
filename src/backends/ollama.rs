@@ -428,7 +428,7 @@ impl ChatProvider for Ollama {
 
         let resp = resp.error_for_status()?;
 
-        Ok(crate::chat::create_sse_stream(resp, parse_ollama_sse))
+        Ok(crate::chat::create_ndjson_stream(resp, parse_ollama_sse))
     }
 }
 

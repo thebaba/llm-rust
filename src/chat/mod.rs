@@ -533,6 +533,83 @@ impl ChatMessageBuilder {
     }
 }
 
+/// Creates a Newline-Delimited JSON (NDJSON) stream from an HTTP response.
+///
+/// This is used for APIs like Ollama that send JSON objects separated by single
+/// newlines instead of the standard SSE double-newline format.
+///
+/// # Arguments
+///
+/// * `response` - The HTTP response from the streaming API
+/// * `parser` - Function to parse each JSON line into optional text content
+///
+/// # Returns
+///
+/// A pinned stream of text tokens or an error
+pub(crate) fn create_ndjson_stream<F>(
+    response: reqwest::Response,
+    parser: F,
+) -> std::pin::Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>>
+where
+    F: Fn(&str) -> Result<Option<String>, LLMError> + Send + 'static,
+{
+    let stream = response
+        .bytes_stream()
+        .scan(
+            (String::new(), Vec::new()),
+            move |(buffer, utf8_buffer), chunk| {
+                let result = match chunk {
+                    Ok(bytes) => {
+                        utf8_buffer.extend_from_slice(&bytes);
+
+                        match String::from_utf8(utf8_buffer.clone()) {
+                            Ok(text) => {
+                                buffer.push_str(&text);
+                                utf8_buffer.clear();
+                            }
+                            Err(e) => {
+                                let valid_up_to = e.utf8_error().valid_up_to();
+                                if valid_up_to > 0 {
+                                    let valid =
+                                        String::from_utf8_lossy(&utf8_buffer[..valid_up_to]);
+                                    buffer.push_str(&valid);
+                                    utf8_buffer.drain(..valid_up_to);
+                                }
+                            }
+                        }
+
+                        let mut results = Vec::new();
+
+                        // Split on single newlines for NDJSON format
+                        while let Some(pos) = buffer.find('\n') {
+                            let line = buffer[..pos].to_string();
+                            buffer.drain(..pos + 1);
+
+                            // Skip empty lines
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+
+                            match parser(&line) {
+                                Ok(Some(content)) => results.push(Ok(content)),
+                                Ok(None) => {}
+                                Err(e) => results.push(Err(e)),
+                            }
+                        }
+
+                        Some(results)
+                    }
+                    Err(e) => Some(vec![Err(LLMError::HttpError(e.to_string()))]),
+                };
+
+                async move { result }
+            },
+        )
+        .flat_map(futures::stream::iter);
+
+    Box::pin(stream)
+}
+
 /// Creates a Server-Sent Events (SSE) stream from an HTTP response.
 ///
 /// # Arguments
