@@ -59,6 +59,9 @@ pub struct StreamDelta {
     /// The incremental tool calls, if any
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Extended thinking content (Anthropic-specific)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 /// Breakdown of completion tokens.

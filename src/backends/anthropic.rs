@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use crate::{
     builder::LLMBackend,
     chat::{
-        ChatMessage, ChatProvider, ChatResponse, ChatRole, MessageType, Tool, ToolChoice, Usage,
+        ChatMessage, ChatProvider, ChatResponse, ChatRole, MessageType, StreamChoice, StreamDelta,
+        StreamResponse, Tool, ToolChoice, Usage,
     },
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
@@ -176,6 +177,67 @@ struct AnthropicDelta {
     #[serde(rename = "type")]
     delta_type: Option<String>,
     text: Option<String>,
+}
+
+// ============================================================================
+// Structured Streaming Response Types (for chat_stream_struct)
+// ============================================================================
+
+/// Anthropic SSE event for structured streaming.
+/// Handles all event types: message_start, content_block_start, content_block_delta,
+/// content_block_stop, message_delta, message_stop.
+#[derive(Deserialize, Debug)]
+struct AnthropicStreamEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    /// Index of content block (for content_block_* events)
+    index: Option<usize>,
+    /// Content block data (for content_block_start)
+    content_block: Option<AnthropicContentBlockStart>,
+    /// Delta data (for content_block_delta)
+    delta: Option<AnthropicStreamEventDelta>,
+    /// Message metadata (for message_start)
+    message: Option<AnthropicMessageStart>,
+    /// Usage data (for message_delta)
+    usage: Option<AnthropicUsage>,
+}
+
+/// Content block start data for tool_use, text, or thinking blocks.
+#[derive(Deserialize, Debug)]
+struct AnthropicContentBlockStart {
+    #[serde(rename = "type")]
+    block_type: String,
+    /// Tool call ID (for tool_use blocks)
+    id: Option<String>,
+    /// Tool function name (for tool_use blocks)
+    name: Option<String>,
+    /// Initial text content (for text blocks)
+    text: Option<String>,
+}
+
+/// Delta content for structured streaming.
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct AnthropicStreamEventDelta {
+    #[serde(rename = "type")]
+    delta_type: String,
+    /// Text content (for text_delta)
+    text: Option<String>,
+    /// Partial JSON arguments (for input_json_delta)
+    partial_json: Option<String>,
+    /// Thinking content (for thinking_delta)
+    thinking: Option<String>,
+    /// Stop reason (for message_delta)
+    stop_reason: Option<String>,
+}
+
+/// Message start metadata.
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct AnthropicMessageStart {
+    id: Option<String>,
+    model: Option<String>,
+    usage: Option<AnthropicUsage>,
 }
 
 impl std::fmt::Display for AnthropicCompleteResponse {
@@ -659,6 +721,222 @@ impl ChatProvider for Anthropic {
             parse_anthropic_sse_chunk,
         ))
     }
+
+    /// Sends a structured streaming chat request to Anthropic's API.
+    ///
+    /// Returns a stream of `StreamResponse` objects that include text content,
+    /// tool calls, thinking content, and usage metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `messages` - Slice of chat messages representing the conversation
+    ///
+    /// # Returns
+    ///
+    /// A stream of `StreamResponse` objects or an error
+    async fn chat_stream_struct(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<StreamResponse, LLMError>> + Send>>,
+        LLMError,
+    > {
+        if self.api_key.is_empty() {
+            return Err(LLMError::AuthError("Missing Anthropic API key".to_string()));
+        }
+
+        // Convert messages to Anthropic format (same as chat_with_tools)
+        let anthropic_messages: Vec<AnthropicMessage> = messages
+            .iter()
+            .map(|m| AnthropicMessage {
+                role: match m.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                },
+                content: match &m.message_type {
+                    MessageType::Text => vec![MessageContent {
+                        message_type: Some("text"),
+                        text: Some(&m.content),
+                        image_url: None,
+                        source: None,
+                        tool_use_id: None,
+                        tool_input: None,
+                        tool_name: None,
+                        tool_result_id: None,
+                        tool_output: None,
+                    }],
+                    MessageType::Pdf(raw_bytes) => {
+                        vec![MessageContent {
+                            message_type: Some("document"),
+                            text: None,
+                            image_url: None,
+                            source: Some(ImageSource {
+                                source_type: "base64",
+                                media_type: "application/pdf",
+                                data: BASE64.encode(raw_bytes),
+                            }),
+                            tool_use_id: None,
+                            tool_input: None,
+                            tool_name: None,
+                            tool_result_id: None,
+                            tool_output: None,
+                        }]
+                    }
+                    MessageType::Image((image_mime, raw_bytes)) => {
+                        vec![MessageContent {
+                            message_type: Some("image"),
+                            text: None,
+                            image_url: None,
+                            source: Some(ImageSource {
+                                source_type: "base64",
+                                media_type: image_mime.mime_type(),
+                                data: BASE64.encode(raw_bytes),
+                            }),
+                            tool_use_id: None,
+                            tool_input: None,
+                            tool_name: None,
+                            tool_result_id: None,
+                            tool_output: None,
+                        }]
+                    }
+                    MessageType::ImageURL(ref url) => vec![MessageContent {
+                        message_type: Some("image_url"),
+                        text: None,
+                        image_url: Some(ImageUrlContent { url }),
+                        source: None,
+                        tool_use_id: None,
+                        tool_input: None,
+                        tool_name: None,
+                        tool_result_id: None,
+                        tool_output: None,
+                    }],
+                    MessageType::ToolUse(calls) => calls
+                        .iter()
+                        .map(|c| MessageContent {
+                            message_type: Some("tool_use"),
+                            text: None,
+                            image_url: None,
+                            source: None,
+                            tool_use_id: Some(c.id.clone()),
+                            tool_input: Some(
+                                serde_json::from_str(&c.function.arguments).unwrap_or_default(),
+                            ),
+                            tool_name: Some(c.function.name.clone()),
+                            tool_result_id: None,
+                            tool_output: None,
+                        })
+                        .collect(),
+                    MessageType::ToolResult(results) => results
+                        .iter()
+                        .map(|r| MessageContent {
+                            message_type: Some("tool_result"),
+                            text: None,
+                            image_url: None,
+                            source: None,
+                            tool_use_id: None,
+                            tool_input: None,
+                            tool_name: None,
+                            tool_result_id: Some(r.id.clone()),
+                            tool_output: Some(r.function.arguments.clone()),
+                        })
+                        .collect(),
+                },
+            })
+            .collect();
+
+        // Convert tools to Anthropic format if present
+        let anthropic_tools: Option<Vec<AnthropicTool>> = self.tools.as_ref().map(|tools| {
+            tools
+                .iter()
+                .map(|t| AnthropicTool {
+                    name: &t.function.name,
+                    description: &t.function.description,
+                    schema: &t.function.parameters,
+                })
+                .collect()
+        });
+
+        // Build tool choice
+        let tool_choice: Option<HashMap<String, String>> = match &self.tool_choice {
+            Some(ToolChoice::Auto) => {
+                Some(HashMap::from([("type".to_string(), "auto".to_string())]))
+            }
+            Some(ToolChoice::Any) => {
+                Some(HashMap::from([("type".to_string(), "any".to_string())]))
+            }
+            Some(ToolChoice::Tool(ref tool_name)) => Some(HashMap::from([
+                ("type".to_string(), "tool".to_string()),
+                ("name".to_string(), tool_name.clone()),
+            ])),
+            Some(ToolChoice::None) => {
+                Some(HashMap::from([("type".to_string(), "none".to_string())]))
+            }
+            None => None,
+        };
+
+        let final_tool_choice = if anthropic_tools.is_some() {
+            tool_choice
+        } else {
+            None
+        };
+
+        // Build thinking config if reasoning is enabled
+        let thinking = if self.reasoning {
+            Some(ThinkingConfig {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: self.thinking_budget_tokens.unwrap_or(16000),
+            })
+        } else {
+            None
+        };
+
+        let req_body = AnthropicCompleteRequest {
+            messages: anthropic_messages,
+            model: &self.model,
+            max_tokens: Some(self.max_tokens),
+            temperature: Some(self.temperature),
+            system: Some(&self.system),
+            stream: Some(true),
+            top_p: self.top_p,
+            top_k: self.top_k,
+            tools: anthropic_tools,
+            tool_choice: final_tool_choice,
+            thinking,
+        };
+
+        let mut request = self
+            .client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &self.api_key)
+            .header("Content-Type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .json(&req_body);
+
+        if self.timeout_seconds > 0 {
+            request = request.timeout(std::time::Duration::from_secs(self.timeout_seconds));
+        }
+
+        if log::log_enabled!(log::Level::Trace) {
+            if let Ok(json) = serde_json::to_string(&req_body) {
+                log::trace!("Anthropic stream_struct request payload: {}", json);
+            }
+        }
+
+        log::debug!("Anthropic request: POST /v1/messages (stream_struct)");
+        let response = request.send().await?;
+        log::debug!("Anthropic HTTP status (stream_struct): {}", response.status());
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await?;
+            return Err(LLMError::ResponseFormatError {
+                message: format!("Anthropic API returned error status: {status}"),
+                raw_response: error_text,
+            });
+        }
+
+        Ok(create_anthropic_sse_struct_stream(response))
+    }
 }
 
 #[async_trait]
@@ -761,6 +1039,272 @@ impl crate::LLMProvider for Anthropic {
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }
+}
+
+// ============================================================================
+// Stateful SSE Parser for Structured Streaming
+// ============================================================================
+
+/// Stateful parser for Anthropic's SSE streaming with tool call accumulation.
+///
+/// Handles UTF-8 boundary issues, accumulates tool call arguments across chunks,
+/// and emits structured `StreamResponse` objects.
+struct AnthropicSSEStreamParser {
+    /// Buffer for incomplete SSE events (split across chunks)
+    event_buffer: String,
+    /// Buffer for incomplete UTF-8 sequences
+    utf8_buffer: Vec<u8>,
+    /// Currently accumulating tool calls, indexed by content block index
+    tool_buffers: HashMap<usize, ToolCall>,
+    /// Accumulated usage metadata
+    usage: Option<Usage>,
+    /// Results queue ready to be emitted
+    results: Vec<Result<StreamResponse, LLMError>>,
+}
+
+impl AnthropicSSEStreamParser {
+    /// Create a new parser instance.
+    fn new() -> Self {
+        Self {
+            event_buffer: String::new(),
+            utf8_buffer: Vec::new(),
+            tool_buffers: HashMap::new(),
+            usage: None,
+            results: Vec::new(),
+        }
+    }
+
+    /// Drain and return all accumulated results.
+    fn drain_results(&mut self) -> Vec<Result<StreamResponse, LLMError>> {
+        std::mem::take(&mut self.results)
+    }
+
+    /// Process incoming bytes from the stream.
+    ///
+    /// Handles UTF-8 boundary issues and splits on SSE event boundaries (\n\n).
+    fn process_bytes(&mut self, bytes: &[u8]) {
+        // Append to UTF-8 buffer and try to decode
+        self.utf8_buffer.extend_from_slice(bytes);
+
+        match String::from_utf8(std::mem::take(&mut self.utf8_buffer)) {
+            Ok(text) => {
+                self.event_buffer.push_str(&text);
+            }
+            Err(e) => {
+                // Handle incomplete UTF-8 sequences at chunk boundaries
+                let valid_up_to = e.utf8_error().valid_up_to();
+                let bytes = e.into_bytes();
+                if valid_up_to > 0 {
+                    // SAFETY: We know bytes[..valid_up_to] is valid UTF-8
+                    let valid = unsafe { std::str::from_utf8_unchecked(&bytes[..valid_up_to]) };
+                    self.event_buffer.push_str(valid);
+                }
+                // Keep incomplete sequence for next chunk
+                self.utf8_buffer = bytes[valid_up_to..].to_vec();
+            }
+        }
+
+        // SSE events are separated by double newlines
+        while let Some(pos) = self.event_buffer.find("\n\n") {
+            let event = self.event_buffer[..pos].to_string();
+            self.event_buffer.drain(..pos + 2);
+
+            self.parse_sse_event(&event);
+        }
+    }
+
+    /// Parse a single SSE event.
+    fn parse_sse_event(&mut self, event: &str) {
+        for line in event.lines() {
+            let line = line.trim();
+            if let Some(data) = line.strip_prefix("data: ") {
+                self.parse_data_payload(data);
+            }
+        }
+    }
+
+    /// Parse the JSON data payload from an SSE event.
+    fn parse_data_payload(&mut self, data: &str) {
+        let event: AnthropicStreamEvent = match serde_json::from_str(data) {
+            Ok(e) => e,
+            Err(e) => {
+                log::debug!("Failed to parse Anthropic stream event: {}", e);
+                return;
+            }
+        };
+
+        match event.event_type.as_str() {
+            "message_start" => {
+                // Extract initial usage if present
+                if let Some(msg) = event.message {
+                    if let Some(usage) = msg.usage {
+                        self.usage = Some(Usage {
+                            prompt_tokens: usage.input_tokens,
+                            completion_tokens: usage.output_tokens,
+                            total_tokens: usage.input_tokens + usage.output_tokens,
+                            completion_tokens_details: None,
+                            prompt_tokens_details: usage.cache_read_input_tokens.map(|cached| {
+                                crate::chat::PromptTokensDetails {
+                                    cached_tokens: Some(cached),
+                                    audio_tokens: None,
+                                }
+                            }),
+                        });
+                    }
+                }
+            }
+
+            "content_block_start" => {
+                if let (Some(index), Some(block)) = (event.index, event.content_block) {
+                    match block.block_type.as_str() {
+                        "tool_use" => {
+                            // Start accumulating a new tool call
+                            self.tool_buffers.insert(
+                                index,
+                                ToolCall {
+                                    id: block.id.unwrap_or_default(),
+                                    call_type: "function".to_string(),
+                                    function: FunctionCall {
+                                        name: block.name.unwrap_or_default(),
+                                        arguments: String::new(),
+                                    },
+                                },
+                            );
+                        }
+                        "text" => {
+                            // Emit initial text if present
+                            if let Some(text) = block.text {
+                                if !text.is_empty() {
+                                    self.emit_content(Some(text), None, None);
+                                }
+                            }
+                        }
+                        "thinking" => {
+                            // Thinking block started, no initial content to emit
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            "content_block_delta" => {
+                if let Some(delta) = event.delta {
+                    match delta.delta_type.as_str() {
+                        "text_delta" => {
+                            if let Some(text) = delta.text {
+                                self.emit_content(Some(text), None, None);
+                            }
+                        }
+                        "input_json_delta" => {
+                            // Accumulate tool call arguments
+                            if let (Some(index), Some(partial)) =
+                                (event.index, delta.partial_json)
+                            {
+                                if let Some(tool) = self.tool_buffers.get_mut(&index) {
+                                    tool.function.arguments.push_str(&partial);
+                                }
+                            }
+                        }
+                        "thinking_delta" => {
+                            if let Some(thinking) = delta.thinking {
+                                self.emit_content(None, None, Some(thinking));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            "content_block_stop" => {
+                // Flush completed tool call if present
+                if let Some(index) = event.index {
+                    if let Some(tool) = self.tool_buffers.remove(&index) {
+                        self.emit_content(None, Some(vec![tool]), None);
+                    }
+                }
+            }
+
+            "message_delta" => {
+                // Update usage with final token counts
+                if let Some(usage) = event.usage {
+                    self.usage = Some(Usage {
+                        prompt_tokens: self.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
+                        completion_tokens: usage.output_tokens,
+                        total_tokens: self.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0)
+                            + usage.output_tokens,
+                        completion_tokens_details: None,
+                        prompt_tokens_details: self
+                            .usage
+                            .as_ref()
+                            .and_then(|u| u.prompt_tokens_details.clone()),
+                    });
+                }
+            }
+
+            "message_stop" => {
+                // Emit final response with usage
+                if let Some(usage) = self.usage.take() {
+                    self.results.push(Ok(StreamResponse {
+                        choices: vec![StreamChoice {
+                            delta: StreamDelta {
+                                content: None,
+                                tool_calls: None,
+                                thinking: None,
+                            },
+                        }],
+                        usage: Some(usage),
+                    }));
+                }
+            }
+
+            _ => {
+                // Ignore unknown event types (ping, etc.)
+            }
+        }
+    }
+
+    /// Emit a StreamResponse with the given content.
+    fn emit_content(
+        &mut self,
+        content: Option<String>,
+        tool_calls: Option<Vec<ToolCall>>,
+        thinking: Option<String>,
+    ) {
+        self.results.push(Ok(StreamResponse {
+            choices: vec![StreamChoice {
+                delta: StreamDelta {
+                    content,
+                    tool_calls,
+                    thinking,
+                },
+            }],
+            usage: None,
+        }));
+    }
+}
+
+/// Creates a structured streaming response from an Anthropic HTTP response.
+fn create_anthropic_sse_struct_stream(
+    response: reqwest::Response,
+) -> std::pin::Pin<Box<dyn Stream<Item = Result<StreamResponse, LLMError>> + Send>> {
+    use futures::StreamExt;
+
+    let bytes_stream = response.bytes_stream();
+
+    let stream = bytes_stream
+        .scan(AnthropicSSEStreamParser::new(), |parser, chunk| {
+            let results = match chunk {
+                Ok(bytes) => {
+                    parser.process_bytes(&bytes);
+                    parser.drain_results()
+                }
+                Err(e) => vec![Err(LLMError::HttpError(e.to_string()))],
+            };
+            futures::future::ready(Some(results))
+        })
+        .flat_map(futures::stream::iter);
+
+    Box::pin(stream)
 }
 
 /// Parses a Server-Sent Events (SSE) chunk from Anthropic's streaming API.

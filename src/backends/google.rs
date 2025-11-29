@@ -1146,6 +1146,7 @@ fn parse_google_sse_chunk(chunk: &str) -> Result<Option<crate::chat::StreamRespo
                                 delta: crate::chat::StreamDelta {
                                     content,
                                     tool_calls: None,
+                                    thinking: None,
                                 },
                             }],
                             usage,

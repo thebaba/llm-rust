@@ -673,6 +673,7 @@ pub fn create_sse_stream(
                         delta: StreamDelta {
                             content: None,
                             tool_calls: Some(vec![self.tool_buffer.clone()]),
+                            thinking: None,
                         },
                     }],
                     usage: None,
@@ -701,6 +702,7 @@ pub fn create_sse_stream(
                                     delta: StreamDelta {
                                         content: None,
                                         tool_calls: None,
+                                        thinking: None,
                                     },
                                 }],
                                 usage: Some(usage),
@@ -768,6 +770,7 @@ pub fn create_sse_stream(
                                     delta: StreamDelta {
                                         content,
                                         tool_calls,
+                                        thinking: None,
                                     },
                                 }],
                                 usage: None,

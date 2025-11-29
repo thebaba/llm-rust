@@ -344,6 +344,7 @@ impl OllamaNDJSONStreamParser {
                     delta: StreamDelta {
                         content: None,
                         tool_calls: Some(vec![self.tool_buffer.clone()]),
+                        thinking: None,
                     },
                 }],
                 usage: None,
@@ -428,6 +429,7 @@ impl OllamaNDJSONStreamParser {
                         delta: StreamDelta {
                             content: None,
                             tool_calls: None,
+                            thinking: None,
                         },
                     }],
                     usage: Some(usage),
@@ -473,6 +475,7 @@ impl OllamaNDJSONStreamParser {
                         delta: StreamDelta {
                             content,
                             tool_calls: None,
+                            thinking: None,
                         },
                     }],
                     usage: None,
